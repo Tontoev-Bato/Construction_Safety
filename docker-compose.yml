@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  safety-api:
+    build: .
+    container_name: safety-monitoring-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./weights:/app/weights
+      - ./logs:/app/logs
+    environment:
+      - MODEL_PATH=/app/weights/best.pt
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/detection/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
