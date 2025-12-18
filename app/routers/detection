@@ -1,0 +1,224 @@
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
+import cv2
+import numpy as np
+from typing import Optional
+import base64
+import os
+import uuid
+from datetime import datetime
+
+
+from app.models import safety_monitor
+from app.schemas import (
+    DetectionResponse, 
+    DetectionResponseWithImage,
+    ImageBase64, 
+    HealthCheck
+)
+from app.utils import draw_detections, image_to_base64
+
+
+router = APIRouter(prefix="/api/v1/detection", tags=["detection"])
+
+
+def read_image_from_upload(file: UploadFile) -> np.ndarray:
+    """Read image from UploadFile"""
+    contents = file.file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if image is None:
+        raise HTTPException(status_code=400, detail="Failed to read image")
+    
+    return image
+
+
+def save_result_image(image: np.ndarray) -> str:
+    """Save result image and return path"""
+    # Create unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"result_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
+    filepath = os.path.join("static", filename)
+    
+    # Save image
+    cv2.imwrite(filepath, image)
+    return filepath
+
+
+@router.get("/health", response_model=HealthCheck)
+async def health_check():
+    """API health check"""
+    return {
+        "status": "healthy",
+        "version": "1.0.0",
+        "model_loaded": safety_monitor.is_model_loaded()
+    }
+
+
+@router.post("/detect", response_model=DetectionResponse)
+async def detect(
+    image: UploadFile = File(...),
+    confidence_threshold: Optional[float] = Query(None, description="Confidence threshold for detection"),
+    return_image: bool = Query(False, description="Return image with bounding boxes")
+):
+    """
+    Safety object detection on image
+    
+    - **image**: Image for analysis
+    - **confidence_threshold**: Confidence threshold (default 0.3)
+    - **return_image**: If True, returns image with bounding boxes in base64
+    """
+    try:
+        # Check if model is loaded
+        if not safety_monitor.is_model_loaded():
+            raise HTTPException(status_code=500, detail="Model not loaded")
+        
+        # Check file type
+        if not image.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Read image
+        image_array = read_image_from_upload(image)
+        
+        # Perform prediction
+        result = safety_monitor.predict(
+            image_array, 
+            confidence_threshold=confidence_threshold
+        )
+        
+        # If need to return image
+        if return_image:
+            # Draw bounding boxes on image
+            image_with_boxes = draw_detections(
+                image_array, 
+                result['detections'], 
+                result['safety_status']
+            )
+            
+            # Convert to base64
+            image_base64 = image_to_base64(image_with_boxes)
+            
+            return DetectionResponseWithImage(
+                status="success",
+                message="Detection completed with image",
+                detections=result['detections'],
+                safety_status=result['safety_status'],
+                frame_size=result['frame_size'],
+                inference_time=result['inference_time'],
+                image_base64=image_base64
+            )
+        
+        # Return JSON only
+        return DetectionResponse(
+            status="success",
+            message="Detection completed",
+            detections=result['detections'],
+            safety_status=result['safety_status'],
+            frame_size=result['frame_size'],
+            inference_time=result['inference_time']
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
+
+
+@router.post("/detect-and-save")
+async def detect_and_save(
+    image: UploadFile = File(...),
+    confidence_threshold: Optional[float] = Query(None, description="Confidence threshold for detection"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Perform detection and save result to file
+    Returns path to saved file
+    """
+    try:
+        # Check if model is loaded
+        if not safety_monitor.is_model_loaded():
+            raise HTTPException(status_code=500, detail="Model not loaded")
+        
+        # Check file type
+        if not image.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Read image
+        image_array = read_image_from_upload(image)
+        
+        # Perform prediction
+        result = safety_monitor.predict(
+            image_array, 
+            confidence_threshold=confidence_threshold
+        )
+        
+        # Draw bounding boxes on image
+        image_with_boxes = draw_detections(
+            image_array, 
+            result['detections'], 
+            result['safety_status']
+        )
+        
+        # Save image
+        filepath = save_result_image(image_with_boxes)
+        filename = os.path.basename(filepath)
+        
+        # Add URL for file access
+        result['image_url'] = f"/static/{filename}"
+        
+        # Return result with image URL
+        response_data = {
+            "status": "success",
+            "message": "Detection completed and image saved",
+            "detections": result['detections'],
+            "safety_status": result['safety_status'],
+            "frame_size": result['frame_size'],
+            "inference_time": result['inference_time'],
+            "image_url": f"http://localhost:8000/static/{filename}"
+        }
+        
+        return response_data
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
+
+
+@router.post("/detect-base64")
+async def detect_base64(request: ImageBase64):
+    """Safety object detection from base64 string"""
+    try:
+        # Decode base64 string
+        image_data = base64.b64decode(request.image_base64)
+        nparr = np.frombuffer(image_data, np.uint8)
+        image_array = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if image_array is None:
+            raise HTTPException(status_code=400, detail="Invalid base64 image format")
+        
+        # Perform prediction
+        result = safety_monitor.predict(
+            image_array, 
+            confidence_threshold=request.confidence_threshold
+        )
+        
+        # Draw bounding boxes on image
+        image_with_boxes = draw_detections(
+            image_array, 
+            result['detections'], 
+            result['safety_status']
+        )
+        
+        # Convert to base64
+        image_base64 = image_to_base64(image_with_boxes)
+        
+        return DetectionResponseWithImage(
+            status="success",
+            message="Detection completed",
+            detections=result['detections'],
+            safety_status=result['safety_status'],
+            frame_size=result['frame_size'],
+            inference_time=result['inference_time'],
+            image_base64=image_base64
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
